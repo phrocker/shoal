@@ -195,11 +195,11 @@ func isTabletRow(row []byte) bool {
 //
 // Java decoder: `if (value[0] != 0) per = bytes[1:]` — i.e. byte0 != 0
 // means PRESENT, byte0 == 0 means ABSENT/nil. Surfaced in production
-// 2026-05-06: shoal-bootstrap metadata walk on cl-kgun2u sent
-// PrevEndRow=[]byte{} for the first metadata tablet (whose ~pr value
-// was the single byte 0x00 = nil), which tserver rejected with
-// NotServingTabletException because the actual tablet has prevRow=nil
-// and Java treats nil != []byte{} for tablet-extent matching.
+// when shoal-bootstrap metadata walks sent PrevEndRow=[]byte{} for a
+// metadata tablet whose ~pr value was the single byte 0x00 = nil. The
+// tserver rejected with NotServingTabletException because the actual
+// tablet has prevRow=nil and Java treats nil != []byte{} for tablet-
+// extent matching.
 //
 // Reference: core/.../metadata/schema/MetadataSchema.java:165-184.
 func decodePrevRow(value []byte) []byte {

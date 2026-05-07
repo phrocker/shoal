@@ -200,10 +200,10 @@ func (r *Reader) makeWalker(idx *index.Reader, root *index.IndexBlock, dataCodec
 // LG's RootIndex, holds its own per-LG state (leaves, current block,
 // pending cell), and Next() returns cells in Key order WITHIN that LG.
 //
-// Real-world graph tables on cl-kgun2u use a "vertex" named LG to store
-// CF=V cells separately from edge cells in the default LG. A scan that
-// needs both must heap-merge across multiple Readers — the existing
-// fileIter heap in scanserver/scan.go does this naturally; it now gets
+// Real-world graph tables routinely use a named LG (e.g. "vertex") to
+// store one CF separately from the rest of the row's cells in the default
+// LG. A scan that needs both must heap-merge across multiple Readers —
+// the fileIter heap in scanserver/scan.go does this naturally; it gets
 // one fileIter per (file, LG) tuple.
 //
 // Single-LG files (no named LGs) return a 1-element slice that behaves

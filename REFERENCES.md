@@ -100,9 +100,10 @@ cribs land.
 - `core/.../client/rfile/RFileScanner.java` — Marc's prior art (RFile reader
   upstream); reference, do not depend on
 
-## Sharkbite (`/mnt/ExtraDrive/repos/sharkbite/`)
+## Sharkbite
 
-Used as a pattern reference, not a code dependency.
+C++ Accumulo client (https://github.com/phrocker/sharkbite). Used as a
+pattern reference, not a code dependency.
 
 ### What carries over
 - `src/data/client/MetaDataLocationObtainer.cpp:95-135` — metadata-row

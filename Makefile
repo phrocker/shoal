@@ -21,8 +21,8 @@ SHELL := /bin/bash
 
 # Pinned to the exact Apache Thrift compiler version Accumulo's pom uses
 # (version.thrift = 0.17.0). DO NOT use the system thrift — versions may drift.
-THRIFT       ?= /mnt/ExtraDrive/repos/tools/thrift-0.17.0/bin/thrift
-THRIFT_IDL   ?= ../../core/src/main/thrift
+THRIFT       ?= thrift
+THRIFT_IDL   ?= $(ACCUMULO_SRC)/core/src/main/thrift
 THRIFT_OUT   := internal/thrift/gen
 
 # Subset of Accumulo's Thrift IDL shoal needs (read path only).

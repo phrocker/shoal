@@ -37,8 +37,8 @@ hedged single-shot `scan()` calls.
   `continueMultiScan`, or session state. Each scan is self-contained.
 - Per-replica LRU block cache. Per-replica is non-negotiable; shared cache
   defeats hedged reads.
-- Java-side hedge coordinator in `platform/provisioner/` (out of this repo
-  subtree, but called out for completeness).
+- Java-side hedge coordinator (lives in the calling application; the
+  shoal pod itself is unaware of hedging).
 
 **Out of V0:** all other iterators (V1–V4 in the staging plan), FRESH-tier
 reads, server-side BatchScanner (range fan-out happens client-side in the
@@ -58,8 +58,7 @@ lambda-iterator path.
 ## Wire protocol
 
 Apache Thrift, IDL pinned to **0.17.0** (matches Accumulo's
-`version.thrift`). Compiler at
-`/mnt/ExtraDrive/repos/tools/thrift-0.17.0/bin/thrift`.
+`version.thrift`). The compiler version is enforced by `make thrift-check`.
 
 Transport: `TFramedTransport`. Protocol: `TCompactProtocol` wrapped in a
 custom `AccumuloProtocol` that prepends/validates a header on every

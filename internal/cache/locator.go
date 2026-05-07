@@ -1,8 +1,7 @@
 // LocatorCache: per-table tablet-location cache with exception-driven
-// invalidation. Mirrors the sharkbite LocatorCache.h pattern (see
-// /mnt/ExtraDrive/repos/sharkbite/include/data/extern/concurrentqueue/...
-// — sharkbite uses a per-table sorted map keyed by EndRow and invalidates
-// individual entries on NotServingTablet / TabletNotFoundException).
+// invalidation. Mirrors the sharkbite LocatorCache.h pattern: sharkbite
+// uses a per-table sorted map keyed by EndRow and invalidates individual
+// entries on NotServingTablet / TabletNotFoundException.
 //
 // Lookups are O(log N) via binary search on EndRow. Population is lazy:
 // a miss triggers a TableLocator.LocateTable call; on subsequent

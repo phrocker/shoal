@@ -3,7 +3,7 @@
 // real Accumulo cluster and prints the discovered topology.
 //
 // Useful for shaking out the protocol/scanclient/metadata pipeline end
-// to end against a dev cluster (e.g. cl-kgun2u).
+// to end against a dev cluster.
 //
 // Example:
 //

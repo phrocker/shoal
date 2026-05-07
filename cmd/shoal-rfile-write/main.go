@@ -5,7 +5,7 @@
 //
 //  1. Manual validation:
 //     go run ./cmd/shoal-rfile-write -out /tmp/shoal-test.rf
-//     cd /mnt/ExtraDrive/repos/accumulo
+//     cd $ACCUMULO_SRC
 //     mvn -pl core -am compile
 //     mvn -pl core exec:java \
 //         -Dexec.mainClass=org.apache.accumulo.core.file.rfile.PrintInfo \

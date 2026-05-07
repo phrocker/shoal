@@ -7,7 +7,7 @@
 // non-zero on failure. Suggested commands:
 //
 //	# Maven exec — works from inside the Accumulo repo:
-//	export SHOAL_JAVA_RFILE_VALIDATE='cd /mnt/ExtraDrive/repos/accumulo && \
+//	export SHOAL_JAVA_RFILE_VALIDATE='cd $ACCUMULO_SRC && \
 //	    mvn -q -pl core exec:java \
 //	    -Dexec.mainClass=org.apache.accumulo.core.file.rfile.PrintInfo \
 //	    -Dexec.args=$RFILE'

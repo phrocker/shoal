@@ -16,7 +16,7 @@ import (
 	"github.com/accumulo/shoal/internal/rfile/index"
 )
 
-// BenchmarkWalkBigUserData walks a real 53MB cl-kgun2u user-data RFile
+// BenchmarkWalkBigUserData walks a real ~50MB user-data RFile
 // at /tmp/captured-big-user.rf if present (skips otherwise). Used to
 // track perf as we add visibility-pushdown / zero-copy / cursor-based
 // decoding. Reports cells/sec via b.ReportMetric.
@@ -359,7 +359,7 @@ func (b bytesReaderAtT) ReadAt(p []byte, off int64) (int, error) {
 
 func bytesReaderAt(b []byte) bytesReaderAtT { return bytesReaderAtT(b) }
 
-// BenchmarkWarmCache_BigUserData walks the same 53MB cl-kgun2u file
+// BenchmarkWarmCache_BigUserData walks the same ~50MB user-data file
 // many times against a single shared cache. First iteration populates;
 // subsequent iterations hit cache and skip GCS-equivalent reads + snappy
 // decompression. Reports the speedup over cold reads.

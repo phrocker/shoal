@@ -34,9 +34,9 @@ import (
 // `write(byte[], off, len)` emits one frame header (originalBlockSize)
 // per write() call, so when the BCFile.Writer feeds data in multiple
 // chunks the resulting block is a sequence of frames. Confirmed against
-// 53MB user-data RFiles on cl-kgun2u: a 108KB RFile.index block was
-// stored as a multi-frame stream where the first frame originalSize was
-// 10736 bytes and additional frames followed.
+// real-world RFiles: a 108KB RFile.index block was stored as a
+// multi-frame stream where the first frame originalSize was 10736
+// bytes and additional frames followed.
 //
 // Total uncompressed = sum of every frame's originalBlockSize.
 func decompressSnappy(compressed []byte, rawSize int64) ([]byte, error) {

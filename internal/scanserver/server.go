@@ -156,7 +156,7 @@ func (s *Server) GetActiveScans(ctx context.Context, tinfo *client.TInfo, creden
 // round-trip entirely.
 //
 // We pull the entire RFile into memory rather than streaming because:
-//   - RFiles in cl-kgun2u are 10s of MB to ~100MB — fits comfortably.
+//   - Typical Accumulo RFiles are 10s of MB to ~100MB — fits comfortably.
 //   - The compressed-block cache holds DECOMPRESSED blocks; the BCFile
 //     reader still needs ReaderAt access to the COMPRESSED bytes for
 //     blocks not yet decompressed.

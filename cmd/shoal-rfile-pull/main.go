@@ -4,7 +4,7 @@
 //
 // Example:
 //
-//	./shoal-rfile-pull -src gs://veculo-cl-kgun2u-rfiles/accumulo/tables/2k/A0001.rf \
+//	./shoal-rfile-pull -src gs://your-bucket/accumulo/tables/2k/A0001.rf \
 //	                   -dst internal/rfile/testdata/captured.rf
 //
 // Auth: standard GCS Application Default Credentials. In-cluster, the
