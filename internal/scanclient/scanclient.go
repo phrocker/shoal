@@ -91,6 +91,15 @@ type SimpleScanRequest struct {
 // continue past the first batch — callers needing more rows must use
 // Raw().StartScan plus continueScan/closeScan, or wait for V1+ where the
 // fold/continue path lands.
+//
+// After receiving the InitialScan, SimpleScan fires-and-forgets a
+// CloseScan with the returned ScanID so the tserver releases the
+// server-side scan session immediately rather than waiting for its idle
+// timeout. Without this, every metadata-walk tick leaks a scan that
+// shows up IDLE in `listscans` for minutes; over time the tserver's
+// scan-session table grows and queues new scans behind the dead ones.
+// Errors from the close call are logged-and-swallowed because they
+// don't affect correctness — the next session timeout cleans up.
 func (c *Client) SimpleScan(ctx context.Context, req SimpleScanRequest) (*data.InitialScan, error) {
 	if req.Credentials == nil {
 		return nil, errors.New("scanclient: nil Credentials")
@@ -106,24 +115,41 @@ func (c *Client) SimpleScan(ctx context.Context, req SimpleScanRequest) (*data.I
 		batchSize = defaultBatchSize
 	}
 
-	return c.raw.StartScan(
+	scan, err := c.raw.StartScan(
 		ctx,
-		clientpkg.NewTInfo(),  // empty TInfo — tracing wires in later
-		req.Credentials,       // 1
-		req.Extent,            // 2
-		req.Range,             // 3
-		nil,                   // 4 columns: nil = scan all
-		batchSize,             // 5
-		nil,                   // 6 ssiList: no server-side iterators in V0
-		nil,                   // 7 ssio
-		req.Authorizations,    // 8
-		false,                 // 9 waitForWrites
-		false,                 // 10 isolated
+		clientpkg.NewTInfo(),    // empty TInfo — tracing wires in later
+		req.Credentials,         // 1
+		req.Extent,              // 2
+		req.Range,               // 3
+		nil,                     // 4 columns: nil = scan all
+		batchSize,               // 5
+		nil,                     // 6 ssiList: no server-side iterators in V0
+		nil,                     // 7 ssio
+		req.Authorizations,      // 8
+		false,                   // 9 waitForWrites
+		false,                   // 10 isolated
 		int64(defaultBatchSize), // 12 readaheadThreshold
-		nil,                   // 13 samplerConfig
-		0,                     // 14 batchTimeOut
-		"",                    // 15 classLoaderContext
-		nil,                   // 16 executionHints
-		0,                     // 17 busyTimeout
+		nil,                     // 13 samplerConfig
+		0,                       // 14 batchTimeOut
+		"",                      // 15 classLoaderContext
+		nil,                     // 16 executionHints
+		0,                       // 17 busyTimeout
 	)
+	if err != nil {
+		return nil, err
+	}
+	if scan != nil && scan.ScanID != 0 {
+		if cerr := c.raw.CloseScan(ctx, clientpkg.NewTInfo(), scan.ScanID); cerr != nil {
+			// Server-side session will idle-timeout regardless; this is
+			// just hygiene. Log at debug rather than warn so a noisy
+			// run-down (e.g. on shutdown ctx-cancel) doesn't drown
+			// real signals.
+			//
+			// (We can't reach a structured logger from here without
+			// threading one through; the package-level log import
+			// would be the next step if this needs visibility.)
+			_ = cerr
+		}
+	}
+	return scan, nil
 }

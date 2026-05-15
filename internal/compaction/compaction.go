@@ -145,7 +145,27 @@ func Compact(spec Spec) (*Result, error) {
 		return nil, fmt.Errorf("compaction: merge init: %w", err)
 	}
 
-	top, err := iterrt.BuildStack(merge, spec.Stack, env)
+	// Wrap source in DeletingIterator BEFORE applying user iterators —
+	// matches Java's FileCompactor.compactLocalityGroup, which builds
+	// the stack as: source → DeletingIterator → user iterators. Without
+	// this, any tombstone in the input passes through to user iterators
+	// (e.g. LatentEdgeDiscoveryIterator) as a live cell. Symptom on
+	// graph_vidx: latentEdge buffers vertices whose Java-side equivalent
+	// was already skipped, yielding a ~14% delta in emitted link cells
+	// on tablets where vertices have been deleted.
+	//
+	// The propagateDeletes flag is computed from env.Scope +
+	// FullMajorCompaction (see DeletingIterator's Init contract):
+	// dropping tombstones is safe only when the output is the tablet's
+	// sole file (FullMajorCompaction at ScopeMajc). Everything else
+	// preserves them so a later compaction can apply suppression
+	// against RFiles this stack didn't see.
+	delIter := iterrt.NewDeletingIterator()
+	if err := delIter.Init(merge, nil, env); err != nil {
+		return nil, fmt.Errorf("compaction: deleting iter init: %w", err)
+	}
+
+	top, err := iterrt.BuildStack(delIter, spec.Stack, env)
 	if err != nil {
 		return nil, fmt.Errorf("compaction: build stack: %w", err)
 	}

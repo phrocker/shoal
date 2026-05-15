@@ -34,10 +34,10 @@
 //
 //	# Phase 1 sanity (T2/T3 skipped; just confirms shoal can compact):
 //	shoal-compactor-shadow \
-//	    --inputs gs://veculo-accumulo-data/tenants/cl-kgun2u/.../A001.rf,gs://.../A002.rf \
+//	    --inputs gs://example-bucket/tenants/<cluster>/.../A001.rf,gs://.../A002.rf \
 //	    --iterators "versioning:maxVersions=10" \
 //	    --scope majc \
-//	    --output-rfile gs://veculo-shadow/shoal-output/$(uuidgen).rf
+//	    --output-rfile gs://example-bucket/shoal-output/$(uuidgen).rf
 //
 //	# Phase 1 full T1+T2+T3 with the Java validator wired:
 //	export SHOAL_JAVA_RFILE_VALIDATE='accumulo file rfile-info $RFILE'
@@ -55,7 +55,7 @@
 //	    --user root \
 //	    --tables graph_vidx,graph \
 //	    --poll-interval 5s \
-//	    --report-prefix gs://veculo-shadow/reports \
+//	    --report-prefix gs://example-bucket/shadow-reports \
 //	    --http-listen :9810
 package main
 

@@ -85,7 +85,7 @@ type TableMetrics struct {
 	// InputsMissing counts compactions we couldn't shadow because the
 	// input files had already been GC'd by the time we tried to fetch.
 	// High counts mean the GC window is shorter than oracle latency —
-	// operator should reduce poll interval or increase Veculo GC
+	// operator should reduce poll interval or increase Accumulo GC
 	// hold-time.
 	InputsMissing atomic.Int64
 

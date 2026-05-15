@@ -51,9 +51,25 @@ type Locator struct {
 // New connects to a ZK quorum, resolves the instance name to its instance
 // UUID, and returns a Locator ready to issue further lookups.
 func New(servers []string, instanceName string, sessionTimeout time.Duration) (*Locator, error) {
+	return NewWithAuth(servers, instanceName, sessionTimeout, "")
+}
+
+// NewWithAuth is New plus an optional digest-auth secret. When non-empty
+// the locator's ZK session adds ("digest", "accumulo:"+secret) before
+// the first GetRaw / Children call, matching Accumulo's instance-secret
+// scheme (core ZooSession.digestAuth). World-readable znodes (root
+// tablet, namespaces JSON, instance UUID) don't need this; per-table
+// /config znodes do.
+func NewWithAuth(servers []string, instanceName string, sessionTimeout time.Duration, instanceSecret string) (*Locator, error) {
 	conn, _, err := gozk.Connect(servers, sessionTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("zk connect: %w", err)
+	}
+	if instanceSecret != "" {
+		if err := conn.AddAuth("digest", []byte("accumulo:"+instanceSecret)); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("zk add digest auth: %w", err)
+		}
 	}
 	l := &Locator{conn: conn, instanceName: instanceName}
 	id, err := l.lookupInstanceID()
@@ -93,6 +109,36 @@ func (l *Locator) RootTabletLocation(_ context.Context) (*Location, error) {
 		return nil, fmt.Errorf("get %s: %w", p, err)
 	}
 	return parseRootTabletMetadata(data)
+}
+
+// InstancePath returns the absolute ZK path for the bound instance,
+// i.e. "/accumulo/<instance-id>". Useful for callers that need to walk
+// instance-scoped subtrees (table config, etc.).
+func (l *Locator) InstancePath() string {
+	return path.Join(zRoot, l.instanceID)
+}
+
+// GetRaw fetches the raw znode bytes at an absolute path. ErrNoNode from
+// the underlying ZK client is surfaced as a wrapped error so callers can
+// distinguish "missing" from transport failures via errors.Is(err,
+// gozk.ErrNoNode).
+func (l *Locator) GetRaw(_ context.Context, znodePath string) ([]byte, error) {
+	data, _, err := l.conn.Get(znodePath)
+	if err != nil {
+		return nil, fmt.Errorf("get %s: %w", znodePath, err)
+	}
+	return data, nil
+}
+
+// Children returns the child znode names of znodePath. Names are NOT
+// joined with znodePath; callers join as needed. Empty slice for a
+// childless znode; ErrNoNode for a missing znode (wrapped).
+func (l *Locator) Children(_ context.Context, znodePath string) ([]string, error) {
+	names, _, err := l.conn.Children(znodePath)
+	if err != nil {
+		return nil, fmt.Errorf("children %s: %w", znodePath, err)
+	}
+	return names, nil
 }
 
 // rootTabletJSON mirrors RootTabletMetadata.Data (Gson struct).

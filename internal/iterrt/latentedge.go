@@ -25,7 +25,6 @@ import (
 	"math"
 	"sort"
 	"strconv"
-	"time"
 
 	"github.com/accumulo/shoal/internal/rfile/wire"
 )
@@ -128,6 +127,16 @@ func (l *LatentEdgeDiscoveryIterator) Init(source SortedKeyValueIterator, option
 // tessellation cell, runs pairwise similarity at each cell boundary, and
 // merges the emitted link cells with the original cell stream sorted by
 // wire.Key. Subsequent HasTop/GetTopKey/GetTopValue/Next walk the buffer.
+//
+// Emission timestamp is **deterministic**: per tessellation cell we use
+// `max(source cell ts in this tessellation cell) + 1`. This makes the
+// iterator's output a pure function of its input — two runs of the same
+// compaction (or shoal's port vs. Java's reference) produce byte-
+// identical link cells. The +1 keeps emissions strictly newer than every
+// source cell at the same tessellation prefix, preserving the
+// VersioningIterator-stacked-above semantics. Wall-clock timestamps
+// (the old System.currentTimeMillis() / time.Now() shape) made T2 hash
+// compare in the shadow oracle impossible.
 func (l *LatentEdgeDiscoveryIterator) Seek(r Range, columnFamilies [][]byte, inclusive bool) error {
 	l.out = l.out[:0]
 	l.outIndex = 0
@@ -147,7 +156,7 @@ func (l *LatentEdgeDiscoveryIterator) Seek(r Range, columnFamilies [][]byte, inc
 	cellVerts := []string{}
 	cellEmb := map[string][]float32{}
 	var currentCell string
-	emittedTs := time.Now().UnixMilli()
+	var currentCellMaxTS int64 // max source ts seen at currentCell prefix
 
 	for l.source.HasTop() {
 		k := l.source.GetTopKey().Clone()
@@ -155,9 +164,39 @@ func (l *LatentEdgeDiscoveryIterator) Seek(r Range, columnFamilies [][]byte, inc
 		// Pass through every source cell unchanged.
 		l.out = append(l.out, Cell{Key: k, Value: v})
 
+		// Parse cellID for every cell so the max-ts tracker can fold
+		// pass-through link cells (they share the tessellation prefix).
+		// A row without ':' is malformed for this table — treat as a
+		// non-tessellation cell and skip both ts-tracking and embedding
+		// logic.
+		sep := bytes.IndexByte(k.Row, ':')
+		if sep < 0 {
+			if err := l.source.Next(); err != nil {
+				l.err = err
+				return err
+			}
+			continue
+		}
+		cellID := string(k.Row[:sep])
+
+		// Cell boundary: emit for the old cell before resetting.
+		if currentCell != "" && currentCell != cellID {
+			l.processCell(currentCell, cellVerts, cellEmb, currentCellMaxTS+1)
+			cellVerts = cellVerts[:0]
+			for kk := range cellEmb {
+				delete(cellEmb, kk)
+			}
+			currentCellMaxTS = 0
+		}
+		currentCell = cellID
+		if k.Timestamp > currentCellMaxTS {
+			currentCellMaxTS = k.Timestamp
+		}
+
 		// Already-emitted link cells from a previous compaction must NOT
 		// be re-processed for similarity. Pass-through above already kept
-		// them; we just skip the embedding logic.
+		// them and we've folded their ts into the max-tracker; just skip
+		// the embedding logic.
 		if string(k.ColumnFamily) == latentLinkCF {
 			if err := l.source.Next(); err != nil {
 				l.err = err
@@ -175,27 +214,7 @@ func (l *LatentEdgeDiscoveryIterator) Seek(r Range, columnFamilies [][]byte, inc
 			continue
 		}
 
-		// Row format is <cellIdHex>:<vertexId>.
-		sep := bytes.IndexByte(k.Row, ':')
-		if sep < 0 {
-			if err := l.source.Next(); err != nil {
-				l.err = err
-				return err
-			}
-			continue
-		}
-		cellID := string(k.Row[:sep])
 		vertexID := string(k.Row[sep+1:])
-
-		if currentCell != "" && currentCell != cellID {
-			l.processCell(currentCell, cellVerts, cellEmb, emittedTs)
-			cellVerts = cellVerts[:0]
-			for kk := range cellEmb {
-				delete(cellEmb, kk)
-			}
-		}
-		currentCell = cellID
-
 		if emb := parseEmbedding(v); emb != nil && len(cellEmb) < l.maxCellBuffer {
 			if _, dup := cellEmb[vertexID]; !dup {
 				cellVerts = append(cellVerts, vertexID)
@@ -210,7 +229,7 @@ func (l *LatentEdgeDiscoveryIterator) Seek(r Range, columnFamilies [][]byte, inc
 	}
 
 	if currentCell != "" && len(cellEmb) > 0 {
-		l.processCell(currentCell, cellVerts, cellEmb, emittedTs)
+		l.processCell(currentCell, cellVerts, cellEmb, currentCellMaxTS+1)
 	}
 
 	// Sort merged stream by wire.Key ordering.

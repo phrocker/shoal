@@ -18,6 +18,9 @@
 package itercfg
 
 import (
+	"bytes"
+	"compress/gzip"
+	"encoding/binary"
 	"io"
 	"log/slog"
 	"testing"
@@ -31,11 +34,11 @@ func silentLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{}))
 }
 
-// graphVidxStack mirrors the iterator config in cl-kgun2u's graph_vidx
-// table: latentEdgeDiscovery at priority 10, vers at priority 20.
+// graphVidxStack mirrors a representative graph_vidx iterator config:
+// latentEdgeDiscovery at priority 10, vers at priority 20.
 func TestParseStack_GraphVidxMajc(t *testing.T) {
 	props := map[string]string{
-		"table.iterator.majc.latentEdgeDiscovery":                     "10,com.veculo.accumulo.iterators.LatentEdgeDiscoveryIterator",
+		"table.iterator.majc.latentEdgeDiscovery":                     "10,org.apache.accumulo.core.graph.LatentEdgeDiscoveryIterator",
 		"table.iterator.majc.latentEdgeDiscovery.opt.maxCellBuffer":   "200",
 		"table.iterator.majc.latentEdgeDiscovery.opt.maxPairsPerCell": "500",
 		"table.iterator.majc.latentEdgeDiscovery.opt.similarityThreshold": "0.85",
@@ -118,6 +121,99 @@ func TestParseStack_NoIteratorsConfigured(t *testing.T) {
 	if len(got.Stack) != 0 {
 		t.Errorf("stack = %+v, want empty", got.Stack)
 	}
+}
+
+// TestDecodePropBlob_GzipRoundtrip builds a versioned-props blob with
+// the wire layout described in decodePropBlob's doc-comment and asserts
+// the decoder reproduces the original map. Catches breakage in the
+// version/compressed-flag/timestamp/gzip framing without needing a
+// live cluster.
+func TestDecodePropBlob_GzipRoundtrip(t *testing.T) {
+	want := map[string]string{
+		"table.iterator.majc.vers":                                            "20,org.apache.accumulo.core.iterators.user.VersioningIterator",
+		"table.iterator.majc.vers.opt.maxVersions":                            "10",
+		"table.iterator.majc.latentEdgeDiscovery":                             "10,org.apache.accumulo.core.graph.LatentEdgeDiscoveryIterator",
+		"table.iterator.majc.latentEdgeDiscovery.opt.maxCellBuffer":           "200",
+		"table.iterator.majc.latentEdgeDiscovery.opt.maxPairsPerCell":         "500",
+		"table.iterator.majc.latentEdgeDiscovery.opt.similarityThreshold":     "0.85",
+		"table.unrelated.someprop":                                            "ignored",
+	}
+	blob := buildSyntheticPropBlob(t, want, true /*gzip*/)
+
+	got, err := decodePropBlob(blob)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Errorf("entry count: got=%d want=%d", len(got), len(want))
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("key %q: got=%q want=%q", k, got[k], v)
+		}
+	}
+}
+
+// TestDecodePropBlob_UncompressedRoundtrip exercises the compressed=false
+// path. Some Accumulo configs disable gzip on small property sets.
+func TestDecodePropBlob_UncompressedRoundtrip(t *testing.T) {
+	want := map[string]string{
+		"table.iterator.majc.vers":                 "20,VersioningIterator",
+		"table.iterator.majc.vers.opt.maxVersions": "5",
+	}
+	blob := buildSyntheticPropBlob(t, want, false /*no gzip*/)
+	got, err := decodePropBlob(blob)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("key %q: got=%q want=%q", k, got[k], v)
+		}
+	}
+}
+
+// buildSyntheticPropBlob encodes a property map in Java's
+// VersionedPropGzipCodec wire format. Identical layout to the Java code
+// path so the decoder is exercised against the actual on-wire bytes.
+func buildSyntheticPropBlob(t *testing.T, props map[string]string, compressed bool) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	// int32 version=1
+	binary.Write(&buf, binary.BigEndian, uint32(1))
+	// bool compressed
+	if compressed {
+		buf.WriteByte(1)
+	} else {
+		buf.WriteByte(0)
+	}
+	// UTF timestamp
+	ts := "2026-05-15T13:09:09.000000000Z"
+	binary.Write(&buf, binary.BigEndian, uint16(len(ts)))
+	buf.WriteString(ts)
+
+	// Payload: int32 count + UTF pairs.
+	var payload bytes.Buffer
+	binary.Write(&payload, binary.BigEndian, uint32(len(props)))
+	for k, v := range props {
+		binary.Write(&payload, binary.BigEndian, uint16(len(k)))
+		payload.WriteString(k)
+		binary.Write(&payload, binary.BigEndian, uint16(len(v)))
+		payload.WriteString(v)
+	}
+
+	if compressed {
+		gz := gzip.NewWriter(&buf)
+		if _, err := gz.Write(payload.Bytes()); err != nil {
+			t.Fatalf("gzip write: %v", err)
+		}
+		if err := gz.Close(); err != nil {
+			t.Fatalf("gzip close: %v", err)
+		}
+	} else {
+		buf.Write(payload.Bytes())
+	}
+	return buf.Bytes()
 }
 
 func TestSplitPriorityClass(t *testing.T) {

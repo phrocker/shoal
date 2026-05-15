@@ -19,15 +19,37 @@
 // given compaction scope, by reading the table's configuration out of
 // ZooKeeper. Layout (Accumulo 4.0):
 //
-//	/accumulo/<instance-id>/namespaces                                  -> JSON {namespace-id: namespace-name}
-//	/accumulo/<instance-id>/namespaces/<ns-id>/tables                   -> JSON {table-id: table-name}
-//	/accumulo/<instance-id>/tables/<id>/config/<prop-name>              -> value
+//	/accumulo/<instance-id>/namespaces                          -> JSON {namespace-id: namespace-name}
+//	/accumulo/<instance-id>/namespaces/<ns-id>/tables           -> JSON {table-id: table-name}
+//	/accumulo/<instance-id>/tables/<id>/config                  -> versioned-props blob (binary)
+//	/accumulo/<instance-id>/namespaces/<ns-id>/config           -> versioned-props blob (binary)
+//	/accumulo/<instance-id>/config                              -> versioned-props blob (binary)  [site]
 //
 // Name resolution requires (1) parsing `name` into namespace + table
 // halves (TableNameUtil.qualify: "ns.table" or just "table" for default
 // namespace), (2) looking up the namespace id from /namespaces, then
 // (3) looking up the table id from /namespaces/<ns-id>/tables. The
 // JSON-map shape is the same as Java's NamespaceMapping.serializeMap.
+//
+// VERSIONED-PROPS BLOB FORMAT (Java VersionedPropGzipCodec):
+//
+//	int32  encoding version (currently 1)
+//	bool   compressed flag (1 byte: 0x00 or 0x01)
+//	UTF    timestamp string (DataOutputStream.writeUTF: int16 length || UTF-8 bytes)
+//	[ gzip(  // payload, optionally gzip-compressed when the bool is true
+//	    int32  number of (key, value) pairs
+//	    repeated:
+//	      UTF  key
+//	      UTF  value
+//	  ) ]
+//
+// Properties are MERGED across system → namespace → table levels, with
+// table overriding namespace overriding system. Accumulo's actual
+// compactor reads all three; an iterator can be defined at any level.
+// Most installs configure table.iterator.* at the SYSTEM level so it
+// applies to every table by default — the table-level znode is empty
+// even when `accumulo shell config -t graph_vidx` shows the properties
+// (the shell reports the merged effective view).
 //
 // We care about properties of the form:
 //
@@ -49,10 +71,14 @@
 package itercfg
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"path"
 	"sort"
@@ -93,8 +119,8 @@ var ClassAllowlist = map[string]string{
 	"org.apache.accumulo.core.iterators.system.VisibilityFilter": iterrt.IterVisibility,
 
 	// LatentEdgeDiscoveryIterator — the graph_vidx majc emitter.
-	"com.veculo.accumulo.iterators.LatentEdgeDiscoveryIterator":          iterrt.IterLatentEdgeDiscovery,
-	"org.apache.accumulo.veculo.iterators.LatentEdgeDiscoveryIterator":   iterrt.IterLatentEdgeDiscovery,
+	// Lives in core/ under the `accumulo.core.graph` package.
+	"org.apache.accumulo.core.graph.LatentEdgeDiscoveryIterator": iterrt.IterLatentEdgeDiscovery,
 }
 
 // ResolvedStack is the parsed table.iterator.<scope>.* config for one
@@ -315,37 +341,155 @@ func (r *Resolver) Resolve(ctx context.Context, tableID string, scope iterrt.Ite
 	return stack, nil
 }
 
-// loadStack performs the ZK fetch + parse.
+// loadStack performs the ZK fetch + parse. Properties are merged in
+// inheritance order: system → namespace → table. Each level's znode is
+// a versioned-props blob (see decodePropBlob).
 func (r *Resolver) loadStack(ctx context.Context, tableID string, scope iterrt.IteratorScope) (*ResolvedStack, error) {
-	// Accumulo 4.0: property children live under /tables/<id>/config (the
-	// 2.1-era "conf" directory was renamed). A childless directory is a
-	// valid empty config — the table relies on inherited site defaults.
-	confPath := path.Join(r.locator.InstancePath(), "tables", tableID, "config")
-	children, err := r.locator.Children(ctx, confPath)
-	if err != nil {
-		return nil, fmt.Errorf("list table config %s: %w", confPath, err)
-	}
-
 	prefix := "table.iterator." + scopeString(scope) + "."
 
-	props := map[string]string{}
-	for _, child := range children {
-		if !strings.HasPrefix(child, prefix) {
-			continue
-		}
-		data, err := r.locator.GetRaw(ctx, path.Join(confPath, child))
-		if err != nil {
-			r.logger.Warn("itercfg: get prop failed",
-				slog.String("table", tableID),
-				slog.String("prop", child),
-				slog.String("err", err.Error()),
-			)
-			continue
-		}
-		props[child] = string(data)
+	merged := map[string]string{}
+
+	// System level: /accumulo/<id>/config
+	if err := r.mergePropsFrom(ctx, path.Join(r.locator.InstancePath(), "config"), prefix, merged); err != nil {
+		r.logger.Warn("itercfg: system config read failed (continuing without site overrides)",
+			slog.String("err", err.Error()))
 	}
 
-	return parseStack(tableID, scope, prefix, props, r.logger), nil
+	// Namespace level. Look up the table's namespace, then read that
+	// namespace's config znode.
+	tableNS, err := r.tableNamespaceID(ctx, tableID)
+	if err == nil && tableNS != "" {
+		nsPath := path.Join(r.locator.InstancePath(), "namespaces", tableNS, "config")
+		if err := r.mergePropsFrom(ctx, nsPath, prefix, merged); err != nil {
+			r.logger.Debug("itercfg: namespace config read failed",
+				slog.String("ns", tableNS), slog.String("err", err.Error()))
+		}
+	}
+
+	// Table level: /accumulo/<id>/tables/<id>/config
+	tablePath := path.Join(r.locator.InstancePath(), "tables", tableID, "config")
+	if err := r.mergePropsFrom(ctx, tablePath, prefix, merged); err != nil {
+		r.logger.Debug("itercfg: table config read failed",
+			slog.String("table", tableID), slog.String("err", err.Error()))
+	}
+
+	return parseStack(tableID, scope, prefix, merged, r.logger), nil
+}
+
+// mergePropsFrom reads the versioned-props blob at znodePath, decodes
+// it, and merges keys whose name starts with prefix into out (later
+// calls override earlier). A non-existent znode is not an error — some
+// installs don't have namespace-level config znodes at all.
+func (r *Resolver) mergePropsFrom(ctx context.Context, znodePath, prefix string, out map[string]string) error {
+	data, err := r.locator.GetRaw(ctx, znodePath)
+	if err != nil {
+		return err
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	props, err := decodePropBlob(data)
+	if err != nil {
+		return fmt.Errorf("decode %s: %w", znodePath, err)
+	}
+	for k, v := range props {
+		if strings.HasPrefix(k, prefix) {
+			out[k] = v
+		}
+	}
+	return nil
+}
+
+// tableNamespaceID returns the namespace-id znode-value stored at
+// /accumulo/<id>/tables/<table-id>/namespace, or "" if not found.
+func (r *Resolver) tableNamespaceID(ctx context.Context, tableID string) (string, error) {
+	p := path.Join(r.locator.InstancePath(), "tables", tableID, "namespace")
+	data, err := r.locator.GetRaw(ctx, p)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// decodePropBlob parses an Accumulo VersionedPropGzipCodec encoded
+// property blob and returns the property map. Wire layout:
+//
+//	int32   encoding version (must be 1)
+//	bool    compressed flag (1 byte)
+//	UTF     timestamp string (DataOutputStream.writeUTF: int16 length + UTF-8 bytes)
+//	payload either gzip-stream or raw:
+//	  int32 count
+//	  repeated: UTF key, UTF value
+//
+// Mirrors Java's VersionedPropCodec.fromBytes + VersionedPropGzipCodec.decodePayload.
+func decodePropBlob(data []byte) (map[string]string, error) {
+	r := bytes.NewReader(data)
+
+	// EncodingOptions.fromDataStream: readInt() then readBoolean().
+	var version uint32
+	if err := binary.Read(r, binary.BigEndian, &version); err != nil {
+		return nil, fmt.Errorf("read version: %w", err)
+	}
+	if version != 1 {
+		return nil, fmt.Errorf("unsupported props encoding version %d", version)
+	}
+	var compressed byte
+	if err := binary.Read(r, binary.BigEndian, &compressed); err != nil {
+		return nil, fmt.Errorf("read compressed flag: %w", err)
+	}
+
+	// Java DataOutputStream.writeUTF: int16 (unsigned) length + UTF-8 bytes.
+	if _, err := readJavaUTF(r); err != nil {
+		return nil, fmt.Errorf("read timestamp: %w", err)
+	}
+
+	var payload io.Reader = r
+	if compressed == 1 {
+		gz, err := gzip.NewReader(r)
+		if err != nil {
+			return nil, fmt.Errorf("gzip reader: %w", err)
+		}
+		defer gz.Close()
+		payload = gz
+	}
+
+	// Property map: int32 count + count × (UTF key, UTF value).
+	var count uint32
+	if err := binary.Read(payload, binary.BigEndian, &count); err != nil {
+		return nil, fmt.Errorf("read prop count: %w", err)
+	}
+	out := make(map[string]string, count)
+	for i := uint32(0); i < count; i++ {
+		k, err := readJavaUTF(payload)
+		if err != nil {
+			return nil, fmt.Errorf("read key %d: %w", i, err)
+		}
+		v, err := readJavaUTF(payload)
+		if err != nil {
+			return nil, fmt.Errorf("read value %d (key=%q): %w", i, k, err)
+		}
+		out[k] = v
+	}
+	return out, nil
+}
+
+// readJavaUTF reads a string in Java's DataOutputStream.writeUTF format:
+// uint16-be length followed by that many bytes interpreted as "modified
+// UTF-8". For property strings (ASCII / regular UTF-8) the modified
+// encoding is identical to plain UTF-8, so we just slice the bytes.
+func readJavaUTF(r io.Reader) (string, error) {
+	var length uint16
+	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
+		return "", err
+	}
+	if length == 0 {
+		return "", nil
+	}
+	buf := make([]byte, length)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return "", err
+	}
+	return string(buf), nil
 }
 
 // parseStack converts the prop map into an ordered ResolvedStack. Pure
