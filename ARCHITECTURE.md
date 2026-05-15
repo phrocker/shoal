@@ -85,3 +85,151 @@ transport-level failures) — same approach as sharkbite's `LocatorCache` +
 - Hedge coordinator: client SDK in Java provisioner.
 - Cache: per-replica LRU.
 - No FRESH tier.
+
+# Shoal compactors
+
+Shoal's second-half deliverable is a JVM-free compaction implementation.
+Read-fleet replicas (above) handle scan-path traffic; compactors handle
+the write path — merging input RFiles through an iterator stack and
+emitting a single output RFile, byte-equivalent to what Java's
+`FileCompactor` would have produced.
+
+Compactors share read-fleet infrastructure (`internal/rfile`,
+`internal/storage`, `internal/iterrt`) but expose different surface: a
+goroutine that pulls work from the manager's compaction queue rather
+than a Thrift listener that answers scans.
+
+## Iterator runtime (`internal/iterrt`)
+
+`SortedKeyValueIterator` is a near-1:1 Go port of Accumulo's
+`org.apache.accumulo.core.iterators.SortedKeyValueIterator`. Same
+contract — `Seek`/`HasTop`/`GetTopKey`/`GetTopValue`/`Next`/`Init`/
+`DeepCopy` — so a Go iterator can be parity-tested against its Java
+reference with no impedance mismatch. Ported iterators:
+
+- `VersioningIterator` — newest-N per (row, cf, cq, cv).
+- `DeletingIterator` — tombstone suppression; uses
+  `PartialKey.ROW_COLFAM_COLQUAL_COLVIS` to skip a deleted
+  coordinate's older versions.
+- `VisibilityFilter` — column-visibility evaluation (also used in V0
+  scan path).
+- `MergingIterator` — heap-merge over N source RFiles, the bottom of
+  every compaction stack.
+- `LatentEdgeDiscoveryIterator` — example of a non-system, table-
+  specific majc iterator that emits new cells (the "link" cells in
+  the graph-vidx pattern). Carries the deterministic-emission-
+  timestamp contract described below.
+
+Stack composition mirrors Accumulo's
+`IteratorConfigUtil.loadIterators`: specs are sorted ascending by
+priority, then each is `Init`'d on top of the previous, so lower
+priority = lower in stack = closer to source.
+
+## Compaction stack shape
+
+For a compactor invocation the stack is built bottom-up:
+
+```
+N source RFiles → MergingIterator → DeletingIterator → user iterators (priority asc) → output writer
+```
+
+`DeletingIterator` is auto-wrapped between the merge and the
+user-configured iterators (matching Java's
+`FileCompactor.compactLocalityGroup`). Without it, tombstones leak
+into user iterators as live cells and divergence from Java becomes
+inevitable.
+
+## Deterministic emission contract
+
+Any iterator that emits *new* cells during compaction (as opposed to
+filtering or passing through) MUST use a deterministic timestamp
+derived from its input — typically `max(source cell ts in the same
+emission boundary) + 1`. Wall-clock timestamps (`time.Now()`,
+`System.currentTimeMillis()`) break reproducibility: two compactions
+of the same input bytes at different times would produce different
+outputs, which makes parity validation impossible.
+
+The `+1` keeps emissions strictly newer than every source cell in
+the same boundary, preserving the "newest version first" invariant
+the stacked `VersioningIterator` expects.
+
+## Iterator-config resolver (`internal/shadow/itercfg`)
+
+Reads the table's `table.iterator.<scope>.*` properties out of ZK
+and materializes them into an ordered `[]IterSpec`. Layout (Accumulo
+4.0):
+
+```
+/accumulo/<uuid>/config                       → site/system props blob
+/accumulo/<uuid>/namespaces/<ns-id>/config    → namespace props blob
+/accumulo/<uuid>/tables/<table-id>/config     → table props blob
+```
+
+Each blob is `VersionedPropGzipCodec`-encoded: `int32 version || bool
+compressed || writeUTF timestamp || [gzip(int32 count, (writeUTF
+key, writeUTF value)*)]`. Properties merge in inheritance order
+(system → namespace → table), and ZK ACLs require digest auth with
+`accumulo:<instance-secret>` for reads. Iterators referencing
+classes not on the resolver's allowlist are reported as `Skipped`
+rather than dropping the entire stack — operators see which iterator
+a table needs ported before parity is meaningful.
+
+# Shadow oracle
+
+The shadow oracle is shoal's correctness gate: it runs alongside
+Java compactions, runs shoal's compactor on the same inputs, and
+asserts byte-equivalent output. Until the oracle is green for 24h
+on a workload, the shoal compactor doesn't replace Java's.
+
+## Tiers
+
+- **T1**: Java's `accumulo file rfile-info` reads shoal's output.
+  Tests the wire-format / RFile-writer side. Env-gated; absent
+  validator = T1 not attempted, not a failure.
+- **T2**: streaming SHA-256 over a canonical encoding of every cell
+  (length-prefixed row || cf || cq || cv || int64-le ts || del-flag
+  || value). Both shoal and Java fold cells into the hash in a
+  single pass — O(1) memory per side regardless of input size.
+  Equal digests prove cell-sequence equivalence by construction
+  (RFile cells are sorted, so set-equal under canonical encoding ⇒
+  sequence-equal).
+- **T3**: vestigial. Originally a random point-lookup probe to
+  catch block-index / bloom divergence the linear walk might miss.
+  Subsumed by T2: if every cell at every position matches, no
+  alternate read path can yield a different result. Field is
+  preserved in the Report struct for wire compatibility but always
+  `Attempted=false`.
+- **T4**: per-file `CellsByCF` count map. Folded into the T2 pass.
+  Informational — used by operators to localize divergences when
+  T2 fails.
+
+## Service shape
+
+`cmd/shoal-compactor-shadow` runs in two modes:
+
+- **Single-shot CLI**: explicit `(inputs, iterator-stack, optional
+  java-output)` args; one Compare call; structured report to stdout
+  or object storage. Used for debugging a specific divergence.
+- **Service**: long-running daemon. A metadata poller watches one
+  or more tables; when a tablet's `file:` set changes (a compaction
+  committed), the event flows into a bounded oracle worker pool.
+  Each worker fetches inputs + Java output from object storage,
+  runs Compare, and uploads a JSON report under
+  `<reportPrefix>/<table-id>/<unix-nanos>.json`. Prometheus-style
+  metrics on `:9810/metrics` and `/metrics-json`.
+
+## Memory shape
+
+Shadow's per-event cost is dominated by the GCS-fetched byte
+buffers (input RFiles + Java output) held in memory for re-seekable
+reads. The streaming hash itself is O(1). Memory grows linearly
+with the sum of input file sizes — so the service applies a
+configurable cap (`maxInputBytes`, default 500 MiB) and skips
+pathologically large events, surfacing them via
+`shadow_inputs_oversized_total`. A future refactor that teaches
+`bcfile.Reader` to ranged-read from object storage on demand would
+drop the byte-buffer cost.
+
+See [`docs/shadow-runbook.md`](docs/shadow-runbook.md) for the
+operator-facing version: how to enable, what reports look like,
+how to triage T1/T2 failures.
